@@ -56,7 +56,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "app.gamenative"
+        applicationId = "app.gamenative.plus"
 
         minSdk = 26
 
@@ -64,7 +64,7 @@ android {
         buildConfigField("boolean", "XR_BUILD", "false")
         buildConfigField("boolean", "MODERN_XR", "false")
 
-        versionCode = 24
+        versionCode = 999999999
         versionName = "1.4.0"
 
         buildConfigField("boolean", "GOLD", "false")

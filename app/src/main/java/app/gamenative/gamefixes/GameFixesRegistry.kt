@@ -2,12 +2,13 @@ package app.gamenative.gamefixes
 
 import android.content.Context
 import app.gamenative.data.GameSource
-import app.gamenative.utils.ContainerUtils
-import app.gamenative.utils.CustomGameScanner
-import app.gamenative.service.gog.GOGConstants
-import app.gamenative.service.gog.GOGService
+import app.gamenative.filedetect.GameFileDetection
 import app.gamenative.service.SteamService
 import app.gamenative.service.epic.EpicService
+import app.gamenative.service.gog.GOGConstants
+import app.gamenative.service.gog.GOGService
+import app.gamenative.utils.ContainerUtils
+import app.gamenative.utils.CustomGameScanner
 import com.winlator.container.Container
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -65,24 +66,50 @@ object GameFixesRegistry {
     fun applyFor(context: Context, appId: String, container: Container) {
         val source = ContainerUtils.extractGameSourceFromContainerId(appId)
         val gameId = ContainerUtils.extractGameIdFromContainerId(appId)?.toString() ?: return
-        val catalogId = when (source) {
-            // EPIC auto-generates the id. so we need the catalog id instead.
+
+        var targetSource = source
+        var targetCatalogId: String? = null
+
+        when (source) {
             GameSource.EPIC -> {
                 val game = EpicService.getEpicGameOf(gameId.toInt()) ?: return
-                game.catalogId
+                targetCatalogId = game.catalogId
             }
-            // Custom game ids are a hash of the install folder, so key on the launch executable's file name.
             GameSource.CUSTOM_GAME -> {
-                val exe = CustomGameScanner.getLaunchExecutable(container)
-                if (exe.isEmpty()) return
-                exe.substringAfterLast('\\').substringAfterLast('/').lowercase()
+                // Ensure file detection has run so metadata is populated
+                GameFileDetection.ensure(context, container)
+                val detectedProps = GameFileDetection.properties(container)
+
+                val steamId = detectedProps["steam_appid"] as? String
+                val gogId = detectedProps["gog_id"] as? String
+
+                if (!steamId.isNullOrEmpty()) {
+                    targetSource = GameSource.STEAM
+                    targetCatalogId = steamId
+                    Timber.i("GameFixesRegistry: Sideloaded game mapped to Steam AppId: $steamId")
+                } else if (!gogId.isNullOrEmpty()) {
+                    targetSource = GameSource.GOG
+                    targetCatalogId = gogId
+                    Timber.i("GameFixesRegistry: Sideloaded game mapped to GOG Id: $gogId")
+                } else {
+                    // Fallback to legacy executable filename lookup
+                    val exe = CustomGameScanner.getLaunchExecutable(container)
+                    if (exe.isNotEmpty()) {
+                        targetCatalogId = exe.substringAfterLast('\\').substringAfterLast('/').lowercase()
+                    }
+                }
             }
-            else -> gameId
+            else -> {
+                targetCatalogId = gameId
+            }
         }
-        Timber.i("GameFixesRegistry: Applying fixes for game: $source $catalogId if available")
-        val fix = fixesProvider()[source to catalogId] ?: return
+
+        if (targetCatalogId.isNullOrEmpty()) return
+
+        Timber.i("GameFixesRegistry: Applying fixes for game: $targetSource $targetCatalogId if available")
+        val fix = fixesProvider()[targetSource to targetCatalogId] ?: return
         val (installPath, installPathWindows) = resolvePaths(context, source, gameId, appId, container) ?: return
-        fix.apply(context, catalogId, installPath, installPathWindows, container)
+        fix.apply(context, targetCatalogId, installPath, installPathWindows, container)
     }
 
     private fun resolvePaths(

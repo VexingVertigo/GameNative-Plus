@@ -1,20 +1,21 @@
 package app.gamenative.ui.screen.library.appscreen
 
 import android.content.Context
+import android.net.Uri
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import app.gamenative.ui.component.dialog.LoadingDialog
 import androidx.compose.runtime.*
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.res.stringResource
+import app.gamenative.PluviaApp
 import app.gamenative.PrefManager
 import app.gamenative.R
 import app.gamenative.data.LibraryItem
 import app.gamenative.events.AndroidEvent
-import app.gamenative.PluviaApp
+import app.gamenative.filedetect.GameFileDetection
+import app.gamenative.ui.component.dialog.LoadingDialog
 import app.gamenative.ui.data.AppMenuOption
 import app.gamenative.ui.data.GameDisplayInfo
 import app.gamenative.ui.enums.AppOptionMenuType
@@ -22,17 +23,21 @@ import app.gamenative.ui.util.SnackbarManager
 import app.gamenative.utils.ContainerUtils
 import app.gamenative.utils.CustomGameScanner
 import app.gamenative.utils.GameMetadataManager
+import app.gamenative.utils.Net
 import app.gamenative.utils.SteamGridDB
 import app.gamenative.utils.StorageUtils
 import com.winlator.container.ContainerData
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import android.net.Uri
-import kotlinx.coroutines.CoroutineScope
-import java.io.File
+import okhttp3.Request
+import org.json.JSONObject
 import timber.log.Timber
 
 /**
@@ -40,7 +45,6 @@ import timber.log.Timber
  */
 class CustomGameAppScreen : BaseAppScreen() {
     companion object {
-        // Shared state for delete dialog - list of appIds that should show the dialog
         private val deleteDialogAppIds = mutableStateListOf<String>()
 
         fun showDeleteDialog(appId: String) {
@@ -57,9 +61,9 @@ class CustomGameAppScreen : BaseAppScreen() {
             return deleteDialogAppIds.contains(appId)
         }
 
-        // Shared state for deletion progress dialog
         var showDeletingDialog by mutableStateOf(false)
     }
+
     @Composable
     override fun getGameDisplayInfo(
         context: Context,
@@ -69,77 +73,147 @@ class CustomGameAppScreen : BaseAppScreen() {
             CustomGameScanner.getFolderPathFromAppId(libraryItem.appId)
         }
 
+        // Detect Steam App ID if present
+        val detectedSteamId = remember(gameFolderPath) {
+            gameFolderPath?.let { path ->
+                val folder = File(path)
+                val relExe = CustomGameScanner.findUniqueExeRelativeToFolder(folder)
+                val targetExe = if (!relExe.isNullOrEmpty()) File(folder, relExe.replace('/', File.separatorChar)) else null
+                GameFileDetection.extractStoreIdentity(folder, targetExe).steamAppId
+            }
+        }
+
         // Helper function to find SteamGridDB images in the game folder
         fun findSteamGridDBImage(folder: File, imageType: String): String? {
             return folder.listFiles()?.firstOrNull { file ->
                 file.name.startsWith("steamgriddb_$imageType") &&
-                (file.name.endsWith(".png", ignoreCase = true) ||
-                 file.name.endsWith(".jpg", ignoreCase = true) ||
-                 file.name.endsWith(".webp", ignoreCase = true))
+                        (file.name.endsWith(".png", ignoreCase = true) ||
+                                file.name.endsWith(".jpg", ignoreCase = true) ||
+                                file.name.endsWith(".webp", ignoreCase = true))
             }?.let { Uri.fromFile(it).toString() }
         }
 
-        // Check for all SteamGridDB images in the game folder
-        // Hero view uses horizontal grid (grid_hero)
-        // A user-supplied "coverh"/"cover" image takes priority over SteamGridDB.
-        // coverh = horizontal cover
-        val heroImageUrl = remember(gameFolderPath) {
-            gameFolderPath?.let { path ->
+        // Hero image: local coverh -> SteamGridDB -> Steam CDN -> null
+        val heroImageUrl = remember(gameFolderPath, detectedSteamId) {
+            val local = gameFolderPath?.let { path ->
                 val folder = File(path)
                 CustomGameScanner.findHeroCoverInFolder(folder)
                     ?: findSteamGridDBImage(folder, "grid_hero")
             }
+            if (!local.isNullOrEmpty()) local
+            else if (!detectedSteamId.isNullOrEmpty()) {
+                "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/$detectedSteamId/library_hero.jpg"
+            } else null
         }
 
-        // Capsule view uses vertical grid (grid_capsule)
-        // A user-supplied "coverv"/"cover" image takes priority over SteamGridDB.
-        // coverv = vertical cover
-        val capsuleUrl = remember(gameFolderPath) {
-            gameFolderPath?.let { path ->
+        // Capsule image: local coverv -> SteamGridDB -> Steam CDN -> null
+        val capsuleUrl = remember(gameFolderPath, detectedSteamId) {
+            val local = gameFolderPath?.let { path ->
                 val folder = File(path)
                 CustomGameScanner.findCapsuleCoverInFolder(folder)
                     ?: findSteamGridDBImage(folder, "grid_capsule")
             }
+            if (!local.isNullOrEmpty()) local
+            else if (!detectedSteamId.isNullOrEmpty()) {
+                "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/$detectedSteamId/library_600x900.jpg"
+            } else null
         }
 
-        // Header view uses heroes endpoint (hero, but not grid_hero)
-        // This is also a horizontal banner, so the user "coverh"/"cover" applies here too.
-        val headerUrl = remember(gameFolderPath) {
-            gameFolderPath?.let { path ->
+        // Header image: local hero -> SteamGridDB hero -> Steam CDN header -> null
+        val headerUrl = remember(gameFolderPath, detectedSteamId) {
+            val local = gameFolderPath?.let { path ->
                 val folder = File(path)
                 CustomGameScanner.findHeroCoverInFolder(folder)
                     ?: folder.listFiles()?.firstOrNull { file ->
                         file.name.startsWith("steamgriddb_hero") &&
-                        !file.name.contains("grid") &&
-                        (file.name.endsWith(".png", ignoreCase = true) ||
-                         file.name.endsWith(".jpg", ignoreCase = true) ||
-                         file.name.endsWith(".webp", ignoreCase = true))
+                                !file.name.contains("grid") &&
+                                (file.name.endsWith(".png", ignoreCase = true) ||
+                                        file.name.endsWith(".jpg", ignoreCase = true) ||
+                                        file.name.endsWith(".webp", ignoreCase = true))
                     }?.let { Uri.fromFile(it).toString() }
             }
+            if (!local.isNullOrEmpty()) local
+            else if (!detectedSteamId.isNullOrEmpty()) {
+                "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/$detectedSteamId/header.jpg"
+            } else null
         }
 
-        val logoUrl = remember(gameFolderPath) {
-            gameFolderPath?.let { path ->
-                val folder = File(path)
-                findSteamGridDBImage(folder, "logo")
+        // Logo image: local -> Steam CDN logo -> null
+        val logoUrl = remember(gameFolderPath, detectedSteamId) {
+            val local = gameFolderPath?.let { path ->
+                findSteamGridDBImage(File(path), "logo")
             }
+            if (!local.isNullOrEmpty()) local
+            else if (!detectedSteamId.isNullOrEmpty()) {
+                "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/$detectedSteamId/logo.png"
+            } else null
         }
 
-        // Note: iconUrl is intentionally null - we extract icons from exe files
-        // and don't use SteamGridDB icons
-
-        // Try to get release date from .gamenative metadata if available
+        var developerName by remember { mutableStateOf(context.getString(R.string.custom_game_unknown_developer)) }
         var releaseDate by remember { mutableStateOf(0L) }
-        LaunchedEffect(gameFolderPath) {
-            gameFolderPath?.let { path ->
-                val folder = File(path)
-                // Get release date from metadata
-                val metadata = app.gamenative.utils.GameMetadataManager.read(folder)
-                releaseDate = metadata?.releaseDate ?: 0L
+
+        // Fetch official metadata (Developer, Release Date) from Steam Web API
+        LaunchedEffect(detectedSteamId, gameFolderPath) {
+            withContext(Dispatchers.IO) {
+                // Check local .gamenative file first
+                gameFolderPath?.let { path ->
+                    val metadata = GameMetadataManager.read(File(path))
+                    if (metadata?.releaseDate != null && metadata.releaseDate > 0L) {
+                        releaseDate = metadata.releaseDate
+                    }
+                }
+
+                // If a Steam ID exists, query the Steam Store API for official details
+                if (!detectedSteamId.isNullOrEmpty()) {
+                    try {
+                        val url = "https://store.steampowered.com/api/appdetails?appids=$detectedSteamId"
+                        val request = Request.Builder().url(url).build()
+                        Net.http.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val body = response.body?.string()
+                                if (!body.isNullOrEmpty()) {
+                                    val json = JSONObject(body)
+                                    val appData = json.optJSONObject(detectedSteamId)
+                                    if (appData?.optBoolean("success") == true) {
+                                        val data = appData.optJSONObject("data")
+
+                                        // Developer
+                                        val developers = data?.optJSONArray("developers")
+                                        if (developers != null && developers.length() > 0) {
+                                            developerName = developers.getString(0)
+                                        }
+
+                                        // Release Date
+                                        val releaseDateObj = data?.optJSONObject("release_date")
+                                        val dateStr = releaseDateObj?.optString("date")
+                                        if (!dateStr.isNullOrEmpty() && releaseDate == 0L) {
+                                            runCatching {
+                                                val formats = listOf(
+                                                    SimpleDateFormat("MMM d, yyyy", Locale.US),
+                                                    SimpleDateFormat("d MMM, yyyy", Locale.US),
+                                                    SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                                                )
+                                                for (fmt in formats) {
+                                                    val parsed = runCatching { fmt.parse(dateStr)?.time }.getOrNull()
+                                                    if (parsed != null) {
+                                                        releaseDate = parsed
+                                                        break
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Timber.tag("CustomGameAppScreen").w(e, "Failed to fetch Steam store details for $detectedSteamId")
+                    }
+                }
             }
         }
 
-        // Calculate folder size on disk (async, will update via state)
+        // Calculate folder size on disk
         var sizeOnDisk by remember { mutableStateOf<String?>(null) }
         LaunchedEffect(gameFolderPath) {
             gameFolderPath?.let { path ->
@@ -155,203 +229,100 @@ class CustomGameAppScreen : BaseAppScreen() {
             }
         }
 
-        // Custom Games don't have Steam metadata, so we use basic info
         return GameDisplayInfo(
             name = libraryItem.name,
-            developer = context.getString(R.string.custom_game_unknown_developer), // Custom Games don't have developer info
+            developer = developerName,
             releaseDate = releaseDate,
             heroImageUrl = heroImageUrl,
-            iconUrl = null, // Icons are extracted from exe files, not from SteamGridDB
+            iconUrl = null,
             gameId = libraryItem.gameId,
             appId = libraryItem.appId,
             installLocation = gameFolderPath,
-            sizeOnDisk = sizeOnDisk, // Calculated folder size
-            sizeFromStore = null, // No store size info
-            lastPlayedText = null, // Not tracked
-            playtimeText = null, // Not tracked
+            sizeOnDisk = sizeOnDisk,
+            sizeFromStore = null,
+            lastPlayedText = null,
+            playtimeText = null,
             logoUrl = logoUrl,
             capsuleUrl = capsuleUrl,
             headerUrl = headerUrl,
         )
     }
 
-    override fun isInstalled(context: Context, libraryItem: LibraryItem): Boolean {
-        // Custom Games are always considered "installed" since they're external
-        return true
-    }
+    override fun isInstalled(context: Context, libraryItem: LibraryItem): Boolean = true
 
-    override fun isValidToDownload(context: Context, libraryItem: LibraryItem): Boolean {
-        // Custom Games cannot be downloaded through the app
-        return false
-    }
+    override fun isValidToDownload(context: Context, libraryItem: LibraryItem): Boolean = false
 
-    override fun isDownloading(context: Context, libraryItem: LibraryItem): Boolean {
-        // Custom Games don't have downloads
-        return false
-    }
+    override fun isDownloading(context: Context, libraryItem: LibraryItem): Boolean = false
 
-    override fun getDownloadProgress(context: Context, libraryItem: LibraryItem): Float {
-        return 0f
-    }
+    override fun getDownloadProgress(context: Context, libraryItem: LibraryItem): Float = 0f
 
-    override fun isUpdatePending(context: Context, libraryItem: LibraryItem): Boolean {
-        return false
-    }
+    override fun isUpdatePending(context: Context, libraryItem: LibraryItem): Boolean = false
 
     override fun onDownloadInstallClick(
         context: Context,
         libraryItem: LibraryItem,
         onClickPlay: (Boolean) -> Unit
     ) {
-        // custom games don't need downloading — go straight to preLaunchApp
         onClickPlay(false)
     }
 
-    override fun onPauseResumeClick(context: Context, libraryItem: LibraryItem) {
-        // Not applicable for Custom Games
-    }
+    override fun onPauseResumeClick(context: Context, libraryItem: LibraryItem) {}
 
     override fun onDeleteDownloadClick(context: Context, libraryItem: LibraryItem) {
-        // Show delete confirmation dialog for Custom Games
         showDeleteDialog(libraryItem.appId)
     }
 
-    override fun onUpdateClick(context: Context, libraryItem: LibraryItem) {
-        // Not applicable for Custom Games
-    }
+    override fun onUpdateClick(context: Context, libraryItem: LibraryItem) {}
 
     override fun getInstallPath(context: Context, libraryItem: LibraryItem): String? {
-        // Custom Games are always "installed" (they're external folders)
         return CustomGameScanner.getFolderPathFromAppId(libraryItem.appId)
     }
 
     override fun getGameFolderPathForImageFetch(context: Context, libraryItem: LibraryItem): String? {
-        // For Custom Games, the install path is the same as the folder path
-        val path = getInstallPath(context, libraryItem)
-        Timber.tag("CustomGameAppScreen").d("getGameFolderPathForImageFetch - appId: ${libraryItem.appId}, path: ${path ?: "null"}")
-        return path
+        return getInstallPath(context, libraryItem)
     }
 
     override fun onAfterFetchImages(context: Context, libraryItem: LibraryItem, gameFolderPath: String) {
-        // Extract icon from executable after fetching images
-        Timber.tag("CustomGameAppScreen").d("onAfterFetchImages called - appId: ${libraryItem.appId}, gameFolderPath: $gameFolderPath")
-
-        // Verify the path was resolved correctly, but use gameFolderPath as fallback
         val resolvedPath = getInstallPath(context, libraryItem)
-        Timber.tag("CustomGameAppScreen").d("Resolved install path: ${resolvedPath ?: "null"}")
-
-        // Use resolvedPath if available, otherwise fall back to gameFolderPath (which was validated by caller)
         val actualGameFolderPath = resolvedPath ?: gameFolderPath
-        if (resolvedPath != gameFolderPath && resolvedPath != null) {
-            Timber.tag("CustomGameAppScreen").w("Path mismatch! gameFolderPath: $gameFolderPath, resolvedPath: $resolvedPath, using: $actualGameFolderPath")
-        } else if (resolvedPath == null) {
-            Timber.tag("CustomGameAppScreen").w("Could not resolve install path, using provided gameFolderPath: $gameFolderPath")
-        }
+        val gameFolder = File(actualGameFolderPath)
 
-        val gameFolder = java.io.File(actualGameFolderPath)
         if (gameFolder.exists() && gameFolder.isDirectory) {
-            Timber.tag("CustomGameAppScreen").i("Extracting icon from executable after fetching images")
             try {
-                // Check if icon already exists by using the same method the UI uses
                 val existingIconPath = CustomGameScanner.findIconFileForCustomGame(context, libraryItem.appId)
                 val hasExtractedIcon = existingIconPath != null && existingIconPath.endsWith(".extracted.ico", ignoreCase = true)
 
-                Timber.tag("CustomGameAppScreen").d("Icon check - existingIconPath: ${existingIconPath ?: "null"}, hasExtractedIcon: $hasExtractedIcon")
-
-                // Also check if there's an extracted icon file anywhere in the folder (limited depth search)
-                // Limit search to 2 levels deep to avoid performance issues with large game folders
-                fun findExtractedIconLimited(dir: File, depth: Int = 0, maxDepth: Int = 2): File? {
-                    if (depth > maxDepth) return null
-                    dir.listFiles()?.forEach { file ->
-                        if (file.isDirectory) {
-                            val found = findExtractedIconLimited(file, depth + 1, maxDepth)
-                            if (found != null) return found
-                        } else if (file.name.endsWith(".extracted.ico", ignoreCase = true)) {
-                            return file
-                        }
-                    }
-                    return null
-                }
-                val extractedIconFile = findExtractedIconLimited(gameFolder)
-                Timber.tag("CustomGameAppScreen").d("Recursive search found extracted icon: ${extractedIconFile?.absolutePath ?: "null"}")
-
-                // If findIconFileForCustomGame didn't find an extracted icon, but one exists, we should still try to extract
-                // (maybe the container path isn't set or the icon is in a different location)
-                val shouldExtract = !hasExtractedIcon || (extractedIconFile != null && existingIconPath != extractedIconFile.absolutePath)
-
-                if (shouldExtract) {
-                    // First, try using the container's selected executable if available
+                if (!hasExtractedIcon) {
                     val containerManager = com.winlator.container.ContainerManager(context)
-                    val hasContainer = containerManager.hasContainer(libraryItem.appId)
-                    Timber.tag("CustomGameAppScreen").d("Container exists: $hasContainer")
-
-                    if (hasContainer) {
+                    if (containerManager.hasContainer(libraryItem.appId)) {
                         val container = containerManager.getContainerById(libraryItem.appId)
                         val relExe = container.executablePath
-                        Timber.tag("CustomGameAppScreen").d("Container executable path: ${relExe ?: "null"}")
-
                         if (!relExe.isNullOrEmpty()) {
-                            val exeFile = java.io.File(gameFolder, relExe.replace('/', java.io.File.separatorChar))
-                            Timber.tag("CustomGameAppScreen").d("Checking executable file: ${exeFile.absolutePath}, exists: ${exeFile.exists()}")
-
+                            val exeFile = File(gameFolder, relExe.replace('/', File.separatorChar))
                             if (exeFile.exists()) {
-                                val outIco = java.io.File(exeFile.parentFile, exeFile.nameWithoutExtension + ".extracted.ico")
-                                Timber.tag("CustomGameAppScreen").d("Attempting to extract icon to: ${outIco.absolutePath}")
-                                val extracted = app.gamenative.utils.ExeIconExtractor.tryExtractMainIcon(exeFile, outIco)
-                                Timber.tag("CustomGameAppScreen").d("Icon extraction result: $extracted")
-
-                                if (extracted) {
-                                    Timber.tag("CustomGameAppScreen").d("Extracted icon from selected executable: ${exeFile.name}")
-                                } else {
-                                    Timber.tag("CustomGameAppScreen").w("Failed to extract icon from selected executable: ${exeFile.name}")
-                                }
+                                val outIco = File(exeFile.parentFile, exeFile.nameWithoutExtension + ".extracted.ico")
+                                app.gamenative.utils.ExeIconExtractor.tryExtractMainIcon(exeFile, outIco)
                             }
                         }
                     }
 
-                    // If that didn't work, try finding a unique executable
                     val uniqueExeRel = CustomGameScanner.findUniqueExeRelativeToFolder(gameFolder)
-                    Timber.tag("CustomGameAppScreen").d("Unique executable found: ${uniqueExeRel ?: "null"}")
-
                     if (!uniqueExeRel.isNullOrEmpty()) {
-                        val exeFile = java.io.File(gameFolder, uniqueExeRel.replace('/', java.io.File.separatorChar))
-                        Timber.tag("CustomGameAppScreen").d("Checking unique executable file: ${exeFile.absolutePath}, exists: ${exeFile.exists()}")
-
+                        val exeFile = File(gameFolder, uniqueExeRel.replace('/', File.separatorChar))
                         if (exeFile.exists()) {
-                            val outIco = java.io.File(exeFile.parentFile, exeFile.nameWithoutExtension + ".extracted.ico")
-                            // Only extract if we haven't already extracted from the selected exe
+                            val outIco = File(exeFile.parentFile, exeFile.nameWithoutExtension + ".extracted.ico")
                             if (!outIco.exists()) {
-                                Timber.tag("CustomGameAppScreen").d("Attempting to extract icon to: ${outIco.absolutePath}")
-                                val extracted = app.gamenative.utils.ExeIconExtractor.tryExtractMainIcon(exeFile, outIco)
-                                Timber.tag("CustomGameAppScreen").d("Icon extraction result: $extracted")
-
-                                if (extracted) {
-                                    Timber.tag("CustomGameAppScreen").d("Extracted icon from unique executable: ${exeFile.name}")
-                                } else {
-                                    Timber.tag("CustomGameAppScreen").w("Failed to extract icon from unique executable: ${exeFile.name}")
-                                }
-                            } else {
-                                Timber.tag("CustomGameAppScreen").d("Icon file already exists: ${outIco.absolutePath}")
+                                app.gamenative.utils.ExeIconExtractor.tryExtractMainIcon(exeFile, outIco)
                             }
                         }
-                    } else {
-                        Timber.tag("CustomGameAppScreen").w("No unique executable found in folder: $gameFolderPath")
                     }
-                } else {
-                    Timber.tag("CustomGameAppScreen").d("Icon already exists, skipping extraction")
                 }
             } catch (e: Exception) {
                 Timber.tag("CustomGameAppScreen").e(e, "Failed to extract icon from executable")
-                // Silently continue - icon extraction is optional
             }
-        } else {
-            Timber.tag("CustomGameAppScreen").e("Game folder does not exist: $gameFolderPath")
         }
     }
 
-    /**
-     * Override Reset Container to show confirmation dialog and preserve drives
-     */
     @Composable
     override fun getResetContainerOption(
         context: Context,
@@ -375,9 +346,6 @@ class CustomGameAppScreen : BaseAppScreen() {
         )
     }
 
-   /**
-     * Custom Game-specific menu options
-     */
     @Composable
     override fun getSourceSpecificMenuOptions(
         context: Context,
@@ -388,10 +356,7 @@ class CustomGameAppScreen : BaseAppScreen() {
         isInstalled: Boolean
     ): List<AppMenuOption> {
         val options = mutableListOf<AppMenuOption>()
-
-        // Fetch images from SteamGridDB for Custom Games
         options.add(getFetchImagesOption(context, libraryItem))
-
         return options
     }
 
@@ -430,7 +395,6 @@ class CustomGameAppScreen : BaseAppScreen() {
         )
     }
 
-    /** Custom games support known, community, and transferred configs. */
     @Composable
     override fun getConfigMenuOptions(
         context: Context,
@@ -467,7 +431,6 @@ class CustomGameAppScreen : BaseAppScreen() {
         val context = LocalContext.current
         val scope = rememberCoroutineScope()
 
-        // Track deletion progress dialog state
         if (showDeletingDialog) {
             LoadingDialog(
                 visible = true,
@@ -476,7 +439,6 @@ class CustomGameAppScreen : BaseAppScreen() {
             )
         }
 
-        // Track delete dialog state
         var showDeleteDialog by remember { mutableStateOf(shouldShowDeleteDialog(libraryItem.appId)) }
 
         LaunchedEffect(libraryItem.appId) {
@@ -486,7 +448,6 @@ class CustomGameAppScreen : BaseAppScreen() {
                 }
         }
 
-        // Delete confirmation dialog
         if (showDeleteDialog) {
             AlertDialog(
                 onDismissRequest = {
@@ -502,15 +463,12 @@ class CustomGameAppScreen : BaseAppScreen() {
                             hideDeleteDialog(libraryItem.appId)
                             showDeletingDialog = true
 
-                            // Delete the game folder and container
                             scope.launch {
                                 try {
-                                    // Delete the container first (needs to be on main thread)
                                     withContext(Dispatchers.Main) {
                                         ContainerUtils.deleteContainer(context, libraryItem.appId)
                                     }
 
-                                    // Remove from manual folders list and invalidate cache
                                     withContext(Dispatchers.IO) {
                                         val folderPath = CustomGameScanner.getFolderPathFromAppId(libraryItem.appId)
                                         cleanupNexusModsForApp(context, libraryItem, folderPath?.let(::File))
@@ -526,14 +484,8 @@ class CustomGameAppScreen : BaseAppScreen() {
                                     }
 
                                     withContext(Dispatchers.Main) {
-                                        // Navigate back and show notification
                                         SnackbarManager.show("\"${libraryItem.name}\" has been deleted")
-
-                                        // Small delay to ensure file system updates are complete
-                                        // before navigating back (list will auto-refresh when displayed)
                                         delay(100)
-
-                                        // Navigate back to game list
                                         onBack()
                                     }
                                 } catch (e: Exception) {
@@ -562,7 +514,3 @@ class CustomGameAppScreen : BaseAppScreen() {
         }
     }
 }
-
-
-
-
