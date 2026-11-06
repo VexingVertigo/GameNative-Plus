@@ -23,6 +23,8 @@ import app.gamenative.service.SteamService.Companion.getMainAppDepots
 import com.winlator.container.Container
 import com.winlator.container.ContainerManager
 import java.io.File
+import java.net.URL
+import java.net.URLEncoder
 import kotlin.math.abs
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -608,18 +610,20 @@ object CustomGameScanner {
 
         handleCustomGameDetection(folder, appId, idPart)
 
-        // Scan folder and binary for store signatures
-        val relExe = findUniqueExeRelativeToFolder(folder)
-        val targetExe = if (!relExe.isNullOrEmpty()) File(folder, relExe.replace('/', File.separatorChar)) else null
-        val storeIdentity = GameFileDetection.extractStoreIdentity(folder, targetExe)
+        // Automatically resolve identity and generate required missing files
+        val resolvedSteam = resolveSteamIdentity(folder)
+        if (resolvedSteam != null) {
+            autoGenerateGameFiles(folder, resolvedSteam.appId)
+        }
+
+        val steamId = resolvedSteam?.appId?.toString()
+        val displayName = resolvedSteam?.title ?: cleanFolderName(folder.name)
 
         // Priority: local manual image overrides -> Steam official CDN assets -> empty string
         var capsuleUrl = findCapsuleCoverInFolder(folder) ?: ""
         var heroUrl = findHeroCoverInFolder(folder) ?: ""
         var headerUrl = ""
-        var displayName = storeIdentity.gameTitle ?: folder.name
 
-        val steamId = storeIdentity.steamAppId
         if (!steamId.isNullOrEmpty()) {
             val steamCapsule = "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/$steamId/library_600x900.jpg"
             val steamHero = "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/$steamId/library_hero.jpg"
@@ -641,6 +645,110 @@ object CustomGameScanner {
             isShared = false,
             gameSource = GameSource.CUSTOM_GAME,
         )
+    }
+
+    data class ResolvedSteamInfo(val appId: Long, val title: String)
+
+    /**
+     * Resolves an App ID and official title from the folder, files, or Steam Store search.
+     */
+    fun resolveSteamIdentity(folder: File): ResolvedSteamInfo? {
+        val rootFile = File(folder, "steam_appid.txt")
+        val subFile = File(folder, "steam_settings/steam_appid.txt")
+        val existingId = when {
+            rootFile.exists() -> rootFile.readText().trim().filter { it.isDigit() }.toLongOrNull()
+            subFile.exists() -> subFile.readText().trim().filter { it.isDigit() }.toLongOrNull()
+            else -> null
+        }
+
+        if (existingId != null && existingId > 0) {
+            val title = fetchTitleFromAppId(existingId) ?: cleanFolderName(folder.name)
+            return ResolvedSteamInfo(existingId, title)
+        }
+
+        val query = cleanFolderName(folder.name)
+        return searchSteamByName(query)
+    }
+
+    private fun cleanFolderName(raw: String): String {
+        return raw
+            .replace(Regex("(?<=[a-z])(?=[A-Z])"), " ")
+            .replace(Regex("(?<=[A-Z])(?=[A-Z][a-z])"), " ")
+            .replace(Regex("(?i)(v[0-9.]+|repack|steamrip|gog|build|rip|deluxe|edition)"), "")
+            .replace(Regex("[._\\-]"), " ")
+            .trim()
+            .replace(Regex("\\s+"), " ")
+    }
+
+    private fun searchSteamByName(name: String): ResolvedSteamInfo? {
+        return try {
+            val encoded = URLEncoder.encode(name, "UTF-8")
+            val url = "https://store.steampowered.com/api/storesearch/?term=$encoded&l=english&cc=US"
+            val text = URL(url).readText()
+            val json = JSONObject(text)
+            val items = json.optJSONArray("items")
+            if (items != null && items.length() > 0) {
+                val first = items.getJSONObject(0)
+                val id = first.optLong("id")
+                val title = first.optString("name")
+                if (id > 0 && title.isNotBlank()) ResolvedSteamInfo(id, title) else null
+            } else null
+        } catch (e: Exception) {
+            Timber.tag("CustomGameScanner").w(e, "Steam search failed for $name")
+            null
+        }
+    }
+
+    private fun fetchTitleFromAppId(appId: Long): String? {
+        return try {
+            val url = "https://store.steampowered.com/api/appdetails?appids=$appId"
+            val text = URL(url).readText()
+            val obj = JSONObject(text).optJSONObject(appId.toString())
+            if (obj?.optBoolean("success") == true) {
+                obj.optJSONObject("data")?.optString("name")
+            } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Auto-creates missing steam_appid.txt, steam_settings/steam_appid.txt, and DLC.txt
+     */
+    fun autoGenerateGameFiles(folder: File, appId: Long) {
+        try {
+            val idStr = appId.toString()
+
+            // 1. Root steam_appid.txt
+            val rootAppId = File(folder, "steam_appid.txt")
+            if (!rootAppId.exists() || rootAppId.readText().trim() != idStr) {
+                rootAppId.writeText(idStr)
+                Timber.tag("CustomGameScanner").i("Generated root steam_appid.txt ($idStr) in ${folder.name}")
+            }
+
+            // 2. steam_settings/steam_appid.txt
+            val steamSettingsDir = File(folder, "steam_settings").apply { mkdirs() }
+            val subAppId = File(steamSettingsDir, "steam_appid.txt")
+            if (!subAppId.exists() || subAppId.readText().trim() != idStr) {
+                subAppId.writeText(idStr)
+            }
+
+            // 3. steam_settings/DLC.txt
+            val dlcFile = File(steamSettingsDir, "DLC.txt")
+            if (!dlcFile.exists()) {
+                val url = "https://store.steampowered.com/api/appdetails?appids=$appId"
+                val text = URL(url).readText()
+                val data = JSONObject(text).optJSONObject(idStr)?.optJSONObject("data")
+                val dlcArray = data?.optJSONArray("dlc")
+                if (dlcArray != null && dlcArray.length() > 0) {
+                    val dlcList = (0 until dlcArray.length()).map { dlcArray.getLong(it) }
+                    dlcFile.writeText(dlcList.joinToString("\n"))
+                    Timber.tag("CustomGameScanner").i("Generated DLC.txt with ${dlcList.size} DLCs for ${folder.name}")
+                }
+            }
+        } catch (e: Exception) {
+            Timber.tag("CustomGameScanner").w(e, "Auto-generation of game files failed for ${folder.name}")
+        }
     }
 
     private fun readGameIdFromFile(folder: File): Int? {
